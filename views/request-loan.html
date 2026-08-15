@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Request a Loan - Micro-Loan Tracker</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+
+<body>
+
+    <header>
+        <h1>Micro-Loan Tracker</h1>
+
+        <nav>
+            <a href="/">Home</a>
+            <a href="/dashboard">Dashboard</a>
+        </nav>
+    </header>
+
+    <main>
+
+        <h2>Request a Micro-Loan</h2>
+
+        <p>Complete the form below to submit your loan request.</p>
+
+        <form action="/request-loan" method="POST">
+
+            <label for="amount">Loan Amount (₦)</label><br>
+            <input
+                type="number"
+                id="amount"
+                name="amount"
+                min="1000"
+                step="100"
+                placeholder="Enter loan amount"
+                required
+            ><br><br>
+
+            <label for="interestRate">Interest Rate (%)</label><br>
+            <input
+                type="number"
+                id="interestRate"
+                name="interestRate"
+                min="0"
+                step="0.1"
+                value="5"
+                required
+            ><br><br>
+
+            <label for="purpose">Loan Purpose</label><br>
+            <textarea
+                id="purpose"
+                name="purpose"
+                rows="5"
+                placeholder="Explain what you need the loan for"
+                required
+            ></textarea><br><br>
+
+            <button type="submit">Submit Loan Request</button>
+
+        </form>
+
+        <br>
+
+        <a href="/dashboard">← Back to Dashboard</a>
+
+    </main>
+
+    <footer>
+        <p>&copy; 2026 Micro-Loan Tracker. All rights reserved.</p>
+    </footer>
+
+</body>
+</html>

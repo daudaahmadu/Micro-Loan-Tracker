@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign In - Micro-Loan Tracker</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+
+<body>
+
+    <header>
+        <h1>Micro-Loan Tracker</h1>
+
+        <nav>
+            <a href="/">Home</a>
+            <a href="/signup">Sign Up</a>
+            <a href="/signin">Sign In</a>
+        </nav>
+    </header>
+
+    <main>
+        <h2>Sign In</h2>
+
+        <p>Sign in to access your Micro-Loan Tracker account.</p>
+
+        <form action="/signin" method="POST">
+
+            <label for="email">Email Address</label><br>
+            <input type="email" id="email" name="email" required><br><br>
+
+            <label for="password">Password</label><br>
+            <input type="password" id="password" name="password" required><br><br>
+
+            <button type="submit">Sign In</button>
+
+        </form>
+
+        <p>
+            Don't have an account?
+            <a href="/signup">Create an account</a>
+        </p>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 Micro-Loan Tracker. All rights reserved.</p>
+    </footer>
+
+</body>
+</html>

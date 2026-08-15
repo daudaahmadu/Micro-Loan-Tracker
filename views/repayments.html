@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Repayments - Micro-Loan Tracker</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+
+<body>
+
+    <header>
+        <h1>Micro-Loan Tracker</h1>
+
+        <nav>
+            <a href="/">Home</a>
+            <a href="/dashboard">Dashboard</a>
+            <a href="/my-loans">My Loans</a>
+        </nav>
+    </header>
+
+    <main>
+
+        <h2>Loan Repayments</h2>
+
+        <p>Record and track your loan repayments.</p>
+
+        <h3>Record a Repayment</h3>
+
+        <form action="/repayments" method="POST">
+
+            <label for="loanId">Loan ID</label><br>
+            <input
+                type="number"
+                id="loanId"
+                name="loanId"
+                min="1"
+                placeholder="Enter Loan ID"
+                required
+            ><br><br>
+
+            <label for="amount">Repayment Amount (₦)</label><br>
+            <input
+                type="number"
+                id="amount"
+                name="amount"
+                min="1"
+                step="1"
+                placeholder="Enter repayment amount"
+                required
+            ><br><br>
+
+            <button type="submit">Record Repayment</button>
+
+        </form>
+
+        <hr>
+
+        <h3>My Repayment Records</h3>
+
+        <div id="repayments">
+            <p>Your repayment records will appear here.</p>
+        </div>
+
+        <br>
+
+        <a href="/dashboard">← Back to Dashboard</a>
+
+    </main>
+
+    <footer>
+        <p>&copy; 2026 Micro-Loan Tracker. All rights reserved.</p>
+    </footer>
+
+</body>
+</html>
