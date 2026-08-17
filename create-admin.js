@@ -1,12 +1,15 @@
+require("dotenv").config();
+
+const fs = require("fs");
+fs.mkdirSync("./database", { recursive: true });
+
 const Database = require("better-sqlite3");
 const bcrypt = require("bcryptjs");
-
 const db = new Database("./database/microloan.db");
 
 const name = "Micro-Loan Admin";
-const email = "admin@microloan.com";
-const password = "Admin12345";
-
+const email = process.env.ADMIN_EMAIL;
+const password = process.env.ADMIN_PASSWORD;
 const hashedPassword = bcrypt.hashSync(password, 10);
 
 try {
