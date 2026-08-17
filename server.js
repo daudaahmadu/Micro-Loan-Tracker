@@ -18,9 +18,10 @@ function requireAdmin(req, res, next) {
     next();
 }
 
-const db = new Database("./database/microloan.db");
 const fs = require("fs");
 fs.mkdirSync("./database", { recursive: true });
+
+const db = new Database("./database/microloan.db");
 app.use(express.urlencoded({ extended: true }));
 app.use(session({
     secret: process.env.SESSION_SECRET,
