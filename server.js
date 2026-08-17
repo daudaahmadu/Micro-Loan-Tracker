@@ -5,7 +5,7 @@ const Database = require("better-sqlite3");
 const bcrypt = require("bcryptjs");
 const session = require("express-session");
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 function requireAdmin(req, res, next) {
     if (!req.session.userId) {
         return res.redirect("/signin");
@@ -927,6 +927,6 @@ if (password.length < 6) {
 });
 
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
     console.log(`Micro-Loan Tracker running at http://localhost:${PORT}`);
 });
