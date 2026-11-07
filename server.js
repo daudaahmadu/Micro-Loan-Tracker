@@ -1,17 +1,305 @@
 require("dotenv").config();
 const express = require("express");
+const crypto = require("crypto");
 const path = require("path");
 const Database = require("better-sqlite3");
 const bcrypt = require("bcryptjs");
 const session = require("express-session");
+const { RedisStore } = require("connect-redis");
+const { createClient } = require("redis");
 const app = express();
 const PORT = process.env.PORT || 3000;
+const isProduction = process.env.NODE_ENV === "production";
+const SESSION_MAX_AGE = 8 * 60 * 60 * 1000;
+const MAX_REQUEST_BODY = "50kb";
+const MAX_NAME_LENGTH = 100;
+const MAX_EMAIL_LENGTH = 254;
+const MAX_PASSWORD_LENGTH = 128;
+const MAX_PURPOSE_LENGTH = 1000;
+const MAX_LOAN_AMOUNT = 100_000_000;
+const MAX_INTEREST_RATE = 100;
+const MAX_REPAYMENT_AMOUNT = 100_000_000;
+const LOGIN_RATE_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_RATE_MAX_FAILURES = 5;
+const CSP_POLICY = [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "script-src 'self'",
+    "style-src 'self'",
+    "img-src 'self'",
+    "connect-src 'self'"
+].join("; ");
+const AUDIT_EVENT_TYPES = new Set([
+    "admin.signin.success",
+    "admin.signin.failure",
+    "admin.logout",
+    "admin.authorization.denied",
+    "admin.loan.approve",
+    "admin.loan.reject",
+    "admin.password.rotate",
+    "admin.bootstrap.create"
+]);
+function validateRedisUrl(value) {
+    if (typeof value !== "string" || value.trim() === "") {
+        throw new Error("REDIS_URL must be configured for the shared session store.");
+    }
+    let parsed;
+    try {
+        parsed = new URL(value);
+    } catch (error) {
+        throw new Error("REDIS_URL is invalid.");
+    }
+    if (!["redis:", "rediss:"].includes(parsed.protocol) || !parsed.hostname) {
+        throw new Error("REDIS_URL must use a Redis URL.");
+    }
+    if (isProduction && parsed.protocol !== "rediss:") {
+        throw new Error("Production REDIS_URL must use TLS.");
+    }
+    return value;
+}
+
+const REDIS_URL = validateRedisUrl(process.env.REDIS_URL);
+const redisKeyPrefix = process.env.REDIS_KEY_PREFIX ||
+    (process.env.NODE_ENV === "test" ? `mlt:test:${process.pid}:` : "mlt:");
+const PLACEHOLDER_SESSION_SECRETS = new Set([
+    "secret",
+    "session_secret",
+    "session-secret",
+    "changeme",
+    "change-me",
+    "change-this",
+    "default",
+    "your-secret",
+    "your-session-secret"
+]);
+
+function validateSessionSecret(secret) {
+    const normalizedSecret = typeof secret === "string" ? secret.trim().toLowerCase() : "";
+    if (
+        typeof secret !== "string" ||
+        secret.length < 32 ||
+        PLACEHOLDER_SESSION_SECRETS.has(normalizedSecret)
+    ) {
+        throw new Error("SESSION_SECRET must be set to a non-placeholder value of at least 32 characters.");
+    }
+    return secret;
+}
+
+const sessionSecret = validateSessionSecret(process.env.SESSION_SECRET);
+
+let redisClient;
+try {
+    redisClient = createClient({
+        url: REDIS_URL,
+        socket: {
+            connectTimeout: 5000,
+            reconnectStrategy: retries => retries > 4
+                ? false
+                : Math.min(Math.max(retries, 1) * 200, 1000)
+        }
+    });
+} catch (error) {
+    throw new Error("Redis client configuration is invalid.");
+}
+redisClient.on("error", () => {
+    // Do not expose connection URLs, credentials, or internal Redis errors.
+});
+const redisReady = redisClient.connect().catch(() => {
+    throw new Error("Redis shared store is unavailable.");
+});
+
+const sessionCookieOptions = {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: "lax",
+    maxAge: SESSION_MAX_AGE
+};
+app.set("trust proxy", isProduction ? 1 : false);
+
+function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, character => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+    }[character]));
+}
+function createCsrfToken() {
+    return crypto.randomBytes(32).toString("hex");
+}
+
+function ensureCsrfToken(req, res, next) {
+    if (!req.session.csrfToken) {
+        req.session.csrfToken = createCsrfToken();
+    }
+    next();
+}
+
+function csrfInput(req) {
+    return `<input type="hidden" name="_csrf" value="${escapeHtml(req.session.csrfToken)}">`;
+}
+
+function renderCsrfPage(filePath, req) {
+    return fs.readFileSync(filePath, "utf8")
+        .replaceAll("<!-- CSRF_TOKEN -->", csrfInput(req));
+}
+
+function csrfProtection(req, res, next) {
+    const submittedToken = req.body?._csrf;
+    const sessionToken = req.session.csrfToken;
+
+    if (
+        typeof submittedToken !== "string" ||
+        typeof sessionToken !== "string" ||
+        submittedToken.length !== sessionToken.length ||
+        !crypto.timingSafeEqual(
+            Buffer.from(submittedToken),
+            Buffer.from(sessionToken)
+        )
+    ) {
+        return res.status(403).send("Invalid CSRF token.");
+    }
+
+    next();
+}
+
+function normalizedEmail(value) {
+    if (typeof value !== "string") {
+        return null;
+    }
+    const email = value.trim().toLowerCase();
+    if (
+        email.length < 3 ||
+        email.length > MAX_EMAIL_LENGTH ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+    ) {
+        return null;
+    }
+    return email;
+}
+
+function boundedText(value, maxLength) {
+    if (typeof value !== "string") {
+        return null;
+    }
+    const text = value.trim();
+    return text.length > 0 && text.length <= maxLength ? text : null;
+}
+
+function numericField(value, maximum) {
+    if (typeof value !== "string" || value.trim() === "") {
+        return null;
+    }
+    const number = Number(value);
+    return Number.isFinite(number) && number >= 0 && number <= maximum
+        ? number
+        : null;
+}
+
+function positiveNumericField(value, maximum) {
+    const number = numericField(value, maximum);
+    return number !== null && number > 0 ? number : null;
+}
+
+function positiveInteger(value) {
+    if (typeof value !== "string" || !/^\d+$/.test(value)) {
+        return null;
+    }
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+function loginAttemptKey(req, email) {
+    const material = `${req.ip}|${email || "invalid-email"}`;
+    return `${redisKeyPrefix}login:${crypto.createHash("sha256").update(material).digest("hex")}`;
+}
+
+const LOGIN_RATE_LIMIT_SCRIPT = `
+local current = tonumber(redis.call("GET", KEYS[1]) or "0")
+if current >= tonumber(ARGV[1]) then
+    return -1
+end
+local updated = redis.call("INCR", KEYS[1])
+if updated == 1 then
+    redis.call("EXPIRE", KEYS[1], tonumber(ARGV[2]))
+end
+return updated
+`;
+
+async function isLoginRateLimited(key) {
+    const failures = Number(await redisClient.get(key) || 0);
+    return Number.isSafeInteger(failures) && failures >= LOGIN_RATE_MAX_FAILURES;
+}
+
+async function recordLoginFailure(key) {
+    return Number(await redisClient.eval(LOGIN_RATE_LIMIT_SCRIPT, {
+        keys: [key],
+        arguments: [
+            String(LOGIN_RATE_MAX_FAILURES),
+            String(Math.ceil(LOGIN_RATE_WINDOW_MS / 1000))
+        ]
+    }));
+}
+
+async function clearLoginFailures(key) {
+    await redisClient.del(key);
+}
+
+function requireRedisAvailability(req, res, next) {
+    if (!redisClient.isReady) {
+        return res.status(503).send("Shared session service is temporarily unavailable.");
+    }
+    next();
+}
+
+function securityHeaders(req, res, next) {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+    res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+    res.setHeader("Content-Security-Policy", CSP_POLICY);
+
+    if (shouldUseHsts(req)) {
+        res.setHeader(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains"
+        );
+    }
+
+    next();
+}
+
+function shouldUseHsts(req, production = isProduction) {
+    return production && req.secure === true;
+}
+
+function authenticatedCacheControl(req, res, next) {
+    if (req.session?.userId) {
+        res.setHeader("Cache-Control", "no-store");
+    }
+    next();
+}
+
 function requireAdmin(req, res, next) {
     if (!req.session.userId) {
         return res.redirect("/signin");
     }
 
     if (req.session.userRole !== "admin") {
+        try {
+            writeAuditLog({
+                actorUserId: req.session.userId,
+                actorRole: req.session.userRole,
+                eventType: "admin.authorization.denied",
+                req
+            });
+        } catch (error) {
+            console.error("Audit logging failed.");
+        }
         return res.status(403).send("Access denied. Admins only.");
     }
 
@@ -19,15 +307,26 @@ function requireAdmin(req, res, next) {
 }
 
 const fs = require("fs");
-fs.mkdirSync("./database", { recursive: true });
+const databasePath = process.env.DATABASE_PATH || "./database/microloan.db";
+fs.mkdirSync(path.dirname(databasePath), { recursive: true });
 
-const db = new Database("./database/microloan.db");
-app.use(express.urlencoded({ extended: true }));
+const db = new Database(databasePath);
+app.use(express.urlencoded({ extended: false, limit: MAX_REQUEST_BODY }));
+app.use(securityHeaders);
+app.use(requireRedisAvailability);
 app.use(session({
-    secret: process.env.SESSION_SECRET,
+    secret: sessionSecret,
+    store: new RedisStore({
+        client: redisClient,
+        prefix: `${redisKeyPrefix}session:`,
+        ttl: Math.floor(SESSION_MAX_AGE / 1000)
+    }),
     resave: false,
-    saveUninitialized: false
+    saveUninitialized: false,
+    cookie: sessionCookieOptions
 }));
+app.use(ensureCsrfToken);
+app.use(authenticatedCacheControl);
 // Create Users table
 db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -66,6 +365,84 @@ db.exec(`
         FOREIGN KEY (user_id) REFERENCES users(id)
     )
 `);
+db.exec(`
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor_user_id INTEGER,
+        actor_role TEXT,
+        event_type TEXT NOT NULL,
+        target_type TEXT,
+        target_id INTEGER,
+        metadata TEXT,
+        ip_hash TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (actor_user_id) REFERENCES users(id)
+    )
+`);
+
+function writeAuditLog({
+    actorUserId = null,
+    actorRole = null,
+    eventType,
+    targetType = null,
+    targetId = null,
+    metadata = null,
+    req = null
+}) {
+    if (!AUDIT_EVENT_TYPES.has(eventType)) {
+        throw new Error("Unsupported audit event type.");
+    }
+    const safeMetadata = metadata === null ? null : JSON.stringify(metadata);
+    const ipHash = req?.ip
+        ? crypto.createHash("sha256")
+            .update(`${sessionSecret}:${req.ip}`)
+            .digest("hex")
+        : null;
+    db.prepare(`
+        INSERT INTO audit_logs (
+            actor_user_id,
+            actor_role,
+            event_type,
+            target_type,
+            target_id,
+            metadata,
+            ip_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+        actorUserId,
+        actorRole,
+        eventType,
+        targetType,
+        targetId,
+        safeMetadata,
+        ipHash
+    );
+}
+
+function transitionLoanStatus({ loanId, nextStatus, actorUserId, req }) {
+    const eventType = nextStatus === "Approved"
+        ? "admin.loan.approve"
+        : "admin.loan.reject";
+    return db.transaction(() => {
+        const result = db.prepare(`
+            UPDATE loans
+            SET status = ?
+            WHERE id = ? AND status = 'Pending'
+        `).run(nextStatus, loanId);
+        if (result.changes !== 1) {
+            return false;
+        }
+        writeAuditLog({
+            actorUserId,
+            actorRole: "admin",
+            eventType,
+            targetType: "loan",
+            targetId: loanId,
+            req
+        });
+        return true;
+    })();
+}
 // Serve files from the public folder
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -76,11 +453,11 @@ app.get("/", (req, res) => {
 
 // Sign Up page
 app.get("/signup", (req, res) => {
-    res.sendFile(path.join(__dirname, "views", "signup.html"));
+    res.send(renderCsrfPage(path.join(__dirname, "views", "signup.html"), req));
 });
 // Sign In page
 app.get("/signin", (req, res) => {
-    res.sendFile(path.join(__dirname, "views", "signin.html"));
+    res.send(renderCsrfPage(path.join(__dirname, "views", "signin.html"), req));
 });
 // Borrower Dashboard
 app.get("/dashboard", (req, res) => {
@@ -140,18 +517,18 @@ if (loans.length === 0) {
 
         return `
             <div>
-                <h4>Loan #${loan.id}</h4>
+                <h4>Loan #${escapeHtml(loan.id)}</h4>
 
                 <p>Repayment Status:
-                    <strong>${repaymentStatus}</strong>
+                    <strong>${escapeHtml(repaymentStatus)}</strong>
                 </p>
 
                 <p>Total Repaid:
-                    ₦${totalRepaid.toLocaleString()}
+                    ₦${escapeHtml(totalRepaid.toLocaleString())}
                 </p>
 
                 <p>Remaining Balance:
-                    ₦${remainingBalance.toLocaleString()}
+                    ₦${escapeHtml(remainingBalance.toLocaleString())}
                 </p>
 
                 <hr>
@@ -167,13 +544,13 @@ let loanList = "";
     } else {
         loanList = loans.map(loan => `
             <div>
-                <h4>Loan #${loan.id}</h4>
-                <p>Amount: ₦${loan.amount.toLocaleString()}</p>
-                <p>Interest Rate: ${loan.interest_rate}%</p>
-                <p>Interest: ₦${loan.interest_amount.toLocaleString()}</p>
-                <p>Total Repayment: ₦${loan.total_repayment.toLocaleString()}</p>
-                <p>Purpose: ${loan.purpose}</p>
-                <p>Status: <strong>${loan.status}</strong></p>
+                <h4>Loan #${escapeHtml(loan.id)}</h4>
+                <p>Amount: ₦${escapeHtml(loan.amount.toLocaleString())}</p>
+                <p>Interest Rate: ${escapeHtml(loan.interest_rate)}%</p>
+                <p>Interest: ₦${escapeHtml(loan.interest_amount.toLocaleString())}</p>
+                <p>Total Repayment: ₦${escapeHtml(loan.total_repayment.toLocaleString())}</p>
+                <p>Purpose: ${escapeHtml(loan.purpose)}</p>
+                <p>Status: <strong>${escapeHtml(loan.status)}</strong></p>
                 <hr>
             </div>
         `).join("");
@@ -223,7 +600,7 @@ dashboard = dashboard.replace(
     "<p>No repayment records available.</p>",
     repaymentSummaryText
 );
-
+    dashboard = dashboard.replaceAll("<!-- CSRF_TOKEN -->", csrfInput(req));
     res.send(dashboard);
 });
 
@@ -285,33 +662,35 @@ const outstandingBalance = Math.max(
 
         loanRequests = loans.map(loan => `
             <div>
-                <h3>Loan #${loan.id}</h3>
+                <h3>Loan #${escapeHtml(loan.id)}</h3>
 
-                <p>Borrower: ${loan.borrower_name}</p>
+                <p>Borrower: ${escapeHtml(loan.borrower_name)}</p>
 
-                <p>Email: ${loan.borrower_email}</p>
+                <p>Email: ${escapeHtml(loan.borrower_email)}</p>
 
-                <p>Amount: ₦${loan.amount.toLocaleString()}</p>
+                <p>Amount: ₦${escapeHtml(loan.amount.toLocaleString())}</p>
 
-                <p>Interest Rate: ${loan.interest_rate}%</p>
+                <p>Interest Rate: ${escapeHtml(loan.interest_rate)}%</p>
 
-                <p>Interest: ₦${loan.interest_amount.toLocaleString()}</p>
+                <p>Interest: ₦${escapeHtml(loan.interest_amount.toLocaleString())}</p>
 
-                <p>Total Repayment: ₦${loan.total_repayment.toLocaleString()}</p>
+                <p>Total Repayment: ₦${escapeHtml(loan.total_repayment.toLocaleString())}</p>
 
-                <p>Purpose: ${loan.purpose}</p>
+                <p>Purpose: ${escapeHtml(loan.purpose)}</p>
 
-                <p>Status: <strong>${loan.status}</strong></p>
+                <p>Status: <strong>${escapeHtml(loan.status)}</strong></p>
 
                 ${loan.status === "Pending" ? `
                     <p>
-                        <a href="/admin/approve-loan/${loan.id}">
-                            <button type="button">Approve</button>
-                        </a>
+                        <form action="/admin/approve-loan/${escapeHtml(loan.id)}" method="POST">
+                            ${csrfInput(req)}
+                            <button type="submit">Approve</button>
+                        </form>
 
-                        <a href="/admin/reject-loan/${loan.id}">
-                            <button type="button">Reject</button>
-                        </a>
+                        <form action="/admin/reject-loan/${escapeHtml(loan.id)}" method="POST">
+                            ${csrfInput(req)}
+                            <button type="submit">Reject</button>
+                        </form>
                     </p>
                 ` : ""}
 
@@ -341,11 +720,11 @@ const outstandingBalance = Math.max(
 
     <p>Rejected Loans: <strong>${rejectedLoans}</strong></p>
 
-    <p>Total Loan Amount: <strong>₦${totalLoanAmount.toLocaleString()}</strong></p>
+    <p>Total Loan Amount: <strong>₦${escapeHtml(totalLoanAmount.toLocaleString())}</strong></p>
 
-    <p>Total Repaid: <strong>₦${totalRepaid.toLocaleString()}</strong></p>
+    <p>Total Repaid: <strong>₦${escapeHtml(totalRepaid.toLocaleString())}</strong></p>
 
-    <p>Outstanding Balance: <strong>₦${outstandingBalance.toLocaleString()}</strong></p>
+    <p>Outstanding Balance: <strong>₦${escapeHtml(outstandingBalance.toLocaleString())}</strong></p>
     `
 );
 
@@ -355,58 +734,55 @@ const outstandingBalance = Math.max(
             ${loanRequests}
         </div>`
     );
+    adminPage = adminPage.replaceAll("<!-- CSRF_TOKEN -->", csrfInput(req));
      
     res.send(adminPage);
 });
 
 
 // Approve Loan
-app.get("/admin/approve-loan/:id", requireAdmin, (req, res) => {
-
+app.post("/admin/approve-loan/:id", requireAdmin, csrfProtection, (req, res) => {
     const loanId = Number(req.params.id);
-
-    const loan = db.prepare(`
-        SELECT *
-        FROM loans
-        WHERE id = ?
-    `).get(loanId);
-
-    if (!loan) {
-        return res.send("Loan not found.");
+    if (!Number.isSafeInteger(loanId) || loanId <= 0) {
+        return res.status(400).send("Invalid loan.");
     }
-
-    db.prepare(`
-        UPDATE loans
-        SET status = 'Approved'
-        WHERE id = ?
-    `).run(loanId);
-
-    res.redirect("/admin-dashboard");
+    try {
+        if (!transitionLoanStatus({
+            loanId,
+            nextStatus: "Approved",
+            actorUserId: req.session.userId,
+            req
+        })) {
+            return res.status(409).send("Loan is no longer pending or could not be found.");
+        }
+        res.redirect("/admin-dashboard");
+    } catch (error) {
+        console.error("Loan approval failed.");
+        res.status(500).send("Could not approve loan.");
+    }
 });
 
 
 // Reject Loan
-app.get("/admin/reject-loan/:id", requireAdmin, (req, res) => {
-
+app.post("/admin/reject-loan/:id", requireAdmin, csrfProtection, (req, res) => {
     const loanId = Number(req.params.id);
-
-    const loan = db.prepare(`
-        SELECT *
-        FROM loans
-        WHERE id = ?
-    `).get(loanId);
-
-    if (!loan) {
-        return res.send("Loan not found.");
+    if (!Number.isSafeInteger(loanId) || loanId <= 0) {
+        return res.status(400).send("Invalid loan.");
     }
-
-    db.prepare(`
-        UPDATE loans
-        SET status = 'Rejected'
-        WHERE id = ?
-    `).run(loanId);
-
-    res.redirect("/admin-dashboard");
+    try {
+        if (!transitionLoanStatus({
+            loanId,
+            nextStatus: "Rejected",
+            actorUserId: req.session.userId,
+            req
+        })) {
+            return res.status(409).send("Loan is no longer pending or could not be found.");
+        }
+        res.redirect("/admin-dashboard");
+    } catch (error) {
+        console.error("Loan rejection failed.");
+        res.status(500).send("Could not reject loan.");
+    }
 });
 
 // My Loans page
@@ -466,51 +842,51 @@ app.get("/my-loans", (req, res) => {
 
             return `
                 <div>
-                    <h3>Loan #${loan.id}</h3>
+                    <h3>Loan #${escapeHtml(loan.id)}</h3>
 
                     <p>
                         Amount:
-                        ₦${loan.amount.toLocaleString()}
+                        ₦${escapeHtml(loan.amount.toLocaleString())}
                     </p>
 
                     <p>
                         Interest Rate:
-                        ${loan.interest_rate}%
+                        ${escapeHtml(loan.interest_rate)}%
                     </p>
 
                     <p>
                         Interest:
-                        ₦${loan.interest_amount.toLocaleString()}
+                        ₦${escapeHtml(loan.interest_amount.toLocaleString())}
                     </p>
 
                     <p>
                         Total Repayment:
-                        ₦${loan.total_repayment.toLocaleString()}
+                        ₦${escapeHtml(loan.total_repayment.toLocaleString())}
                     </p>
 
                     <p>
                         Purpose:
-                        ${loan.purpose}
+                        ${escapeHtml(loan.purpose)}
                     </p>
 
                     <p>
                         Loan Status:
-                        <strong>${loan.status}</strong>
+                        <strong>${escapeHtml(loan.status)}</strong>
                     </p>
 
                     <p>
                         Total Repaid:
-                        ₦${totalRepaid.toLocaleString()}
+                        ₦${escapeHtml(totalRepaid.toLocaleString())}
                     </p>
 
                     <p>
                         Remaining Balance:
-                        ₦${remainingBalance.toLocaleString()}
+                        ₦${escapeHtml(remainingBalance.toLocaleString())}
                     </p>
 
                     <p>
                         Repayment Status:
-                        <strong>${repaymentStatus}</strong>
+                        <strong>${escapeHtml(repaymentStatus)}</strong>
                     </p>
 
                     <hr>
@@ -535,6 +911,7 @@ app.get("/my-loans", (req, res) => {
         "<p>Your loan information will appear here.</p>",
         loanList
     );
+    loansPage = loansPage.replaceAll("<!-- CSRF_TOKEN -->", csrfInput(req));
 
     res.send(loansPage);
 });
@@ -607,17 +984,17 @@ app.get("/repayments", (req, res) => {
                 paymentList = loanRepayments.map(repayment => `
                     <div>
                         <p>
-                            <strong>Payment #${repayment.id}</strong>
+                            <strong>Payment #${escapeHtml(repayment.id)}</strong>
                         </p>
 
                         <p>
                             Amount:
-                            ₦${repayment.amount.toLocaleString()}
+                            ₦${escapeHtml(repayment.amount.toLocaleString())}
                         </p>
 
                         <p>
                             Payment Date:
-                            ${repayment.payment_date}
+                            ${escapeHtml(repayment.payment_date)}
                         </p>
 
                         <hr>
@@ -627,31 +1004,31 @@ app.get("/repayments", (req, res) => {
 
             return `
                 <div>
-                    <h3>Loan #${loan.id}</h3>
+                    <h3>Loan #${escapeHtml(loan.id)}</h3>
 
                     <p>
                         Loan Amount:
-                        ₦${loan.amount.toLocaleString()}
+                        ₦${escapeHtml(loan.amount.toLocaleString())}
                     </p>
 
                     <p>
                         Total Repayment:
-                        ₦${loan.total_repayment.toLocaleString()}
+                        ₦${escapeHtml(loan.total_repayment.toLocaleString())}
                     </p>
 
                     <p>
                         Repayment Status:
-                        <strong>${repaymentStatus}</strong>
+                        <strong>${escapeHtml(repaymentStatus)}</strong>
                     </p>
 
                     <p>
                         Total Repaid:
-                        ₦${totalRepaid.toLocaleString()}
+                        ₦${escapeHtml(totalRepaid.toLocaleString())}
                     </p>
 
                     <p>
                         Remaining Balance:
-                        ₦${remainingBalance.toLocaleString()}
+                        ₦${escapeHtml(remainingBalance.toLocaleString())}
                     </p>
 
                     <h4>Payment Records</h4>
@@ -680,16 +1057,21 @@ app.get("/repayments", (req, res) => {
         "<p>Your repayment records will appear here.</p>",
         repaymentSummary
     );
+    repaymentsPage = repaymentsPage.replaceAll("<!-- CSRF_TOKEN -->", csrfInput(req));
 
     res.send(repaymentsPage);
 });
 // Process Repayment
-app.post("/repayments", (req, res) => {
+app.post("/repayments", csrfProtection, (req, res) => {
     if (!req.session.userId) {
         return res.redirect("/signin");
     }
 
-    const { loanId, amount } = req.body;
+    const loanId = positiveInteger(req.body.loanId);
+    const repaymentAmount = positiveNumericField(req.body.amount, MAX_REPAYMENT_AMOUNT);
+    if (loanId === null || repaymentAmount === null) {
+        return res.status(400).send("Please provide a valid repayment amount and loan ID.");
+    }
 
     const loan = db.prepare(`
         SELECT *
@@ -708,7 +1090,7 @@ app.post("/repayments", (req, res) => {
         <br><br>
 
         Loan Status:
-        <strong>${loan.status}</strong>
+        <strong>${escapeHtml(loan.status)}</strong>
 
         <br><br>
 
@@ -716,11 +1098,6 @@ app.post("/repayments", (req, res) => {
     `);
 }
 
-    const repaymentAmount = Number(amount);
-
-if (!Number.isFinite(repaymentAmount) || repaymentAmount <= 0) {
-    return res.send("Please enter a valid repayment amount.");
-}
     const previousRepayments = db.prepare(`
         SELECT COALESCE(SUM(amount), 0) AS total_paid
         FROM repayments
@@ -735,7 +1112,7 @@ if (!Number.isFinite(repaymentAmount) || repaymentAmount <= 0) {
             Repayment amount is greater than the remaining balance.
 
             <br><br>
-            Remaining balance: ₦${remainingBalance.toLocaleString()}
+            Remaining balance: ₦${escapeHtml(remainingBalance.toLocaleString())}
 
             <br><br>
             <a href="/repayments">Back to Repayments</a>
@@ -761,14 +1138,14 @@ if (!Number.isFinite(repaymentAmount) || repaymentAmount <= 0) {
         res.send(`
             <h1>Repayment Recorded Successfully!</h1>
 
-            <p>Loan ID: ${loanId}</p>
+            <p>Loan ID: ${escapeHtml(loanId)}</p>
 
             <p>Repayment Amount:
-                ₦${repaymentAmount.toLocaleString()}
+                ₦${escapeHtml(repaymentAmount.toLocaleString())}
             </p>
 
             <p>Remaining Balance:
-                ₦${(remainingBalance - repaymentAmount).toLocaleString()}
+                ₦${escapeHtml((remainingBalance - repaymentAmount).toLocaleString())}
             </p>
 
             <br>
@@ -791,29 +1168,20 @@ app.get("/request-loan", (req, res) => {
         return res.redirect("/signin");
     }
 
-    res.sendFile(path.join(__dirname, "views", "request-loan.html"));
+    res.send(renderCsrfPage(path.join(__dirname, "views", "request-loan.html"), req));
 });
 // Process Loan Request
-app.post("/request-loan", (req, res) => {
+app.post("/request-loan", csrfProtection, (req, res) => {
     if (!req.session.userId) {
         return res.redirect("/signin");
     }
 
-    const { amount, interestRate, purpose } = req.body;
-
-   const loanAmount = Number(amount);
-const rate = Number(interestRate);
-const cleanPurpose = purpose ? purpose.trim() : "";
-
-if (
-    !Number.isFinite(loanAmount) ||
-    loanAmount <= 0 ||
-    !Number.isFinite(rate) ||
-    rate < 0 ||
-    cleanPurpose.length === 0
-) {
-    return res.send("Please provide valid loan information.");
-}
+    const loanAmount = positiveNumericField(req.body.amount, MAX_LOAN_AMOUNT);
+    const rate = numericField(req.body.interestRate, MAX_INTEREST_RATE);
+    const cleanPurpose = boundedText(req.body.purpose, MAX_PURPOSE_LENGTH);
+    if (loanAmount === null || rate === null || cleanPurpose === null) {
+        return res.status(400).send("Please provide valid loan information.");
+    }
     const interestAmount = loanAmount * (rate / 100);
     const totalRepayment = loanAmount + interestAmount;
 
@@ -841,9 +1209,9 @@ if (
 
         res.send(`
             <h1>Loan Request Submitted Successfully!</h1>
-            <p>Loan Amount: ₦${loanAmount.toLocaleString()}</p>
-            <p>Interest: ₦${interestAmount.toLocaleString()}</p>
-            <p>Total Repayment: ₦${totalRepayment.toLocaleString()}</p>
+            <p>Loan Amount: ₦${escapeHtml(loanAmount.toLocaleString())}</p>
+            <p>Interest: ₦${escapeHtml(interestAmount.toLocaleString())}</p>
+            <p>Total Repayment: ₦${escapeHtml(totalRepayment.toLocaleString())}</p>
             <p>Status: Pending</p>
             <a href="/dashboard">Back to Dashboard</a>
         `);
@@ -855,59 +1223,135 @@ if (
 });
 
 // Process Sign In
-app.post("/signin", (req, res) => {
-    const { email, password } = req.body;
+app.post("/signin", csrfProtection, async (req, res) => {
+    const email = normalizedEmail(req.body.email);
+    const password = typeof req.body.password === "string" ? req.body.password : "";
+    const rateLimitKey = loginAttemptKey(req, email);
+    try {
+        if (await isLoginRateLimited(rateLimitKey)) {
+            return res.status(429).send("Too many sign-in attempts. Please try again later.");
+        }
 
-    const user = db.prepare(`
-        SELECT * FROM users WHERE email = ?
-    `).get(email);
+        const user = email && password.length <= MAX_PASSWORD_LENGTH
+            ? db.prepare(`
+                SELECT * FROM users WHERE lower(email) = lower(?)
+            `).get(email)
+            : null;
 
-    if (!user) {
-        return res.send("Invalid email or password.");
+        if (!user) {
+            const failureCount = await recordLoginFailure(rateLimitKey);
+            if (failureCount === -1) {
+                return res.status(429).send("Too many sign-in attempts. Please try again later.");
+            }
+            return res.send("Invalid email or password.");
+        }
+
+        const passwordMatch = bcrypt.compareSync(password, user.password);
+        if (!passwordMatch) {
+            if (user.role === "admin") {
+                try {
+                    writeAuditLog({
+                        actorUserId: user.id,
+                        actorRole: "admin",
+                        eventType: "admin.signin.failure",
+                        req
+                    });
+                } catch (error) {
+                    console.error("Audit logging failed.");
+                }
+            }
+            const failureCount = await recordLoginFailure(rateLimitKey);
+            if (failureCount === -1) {
+                return res.status(429).send("Too many sign-in attempts. Please try again later.");
+            }
+            return res.send("Invalid email or password.");
+        }
+
+        await clearLoginFailures(rateLimitKey);
+
+        req.session.regenerate((error) => {
+            if (error) {
+                console.error("Session regeneration failed.");
+                return res.send("Could not sign in.");
+            }
+
+            req.session.userId = user.id;
+            req.session.userName = user.name;
+            req.session.userRole = user.role;
+            req.session.csrfToken = createCsrfToken();
+
+            if (user.role === "admin") {
+                try {
+                    writeAuditLog({
+                        actorUserId: user.id,
+                        actorRole: "admin",
+                        eventType: "admin.signin.success",
+                        req
+                    });
+                } catch (auditError) {
+                    console.error("Audit logging failed.");
+                    return req.session.destroy(() => res.send("Could not sign in."));
+                }
+            }
+
+            if (user.role === "admin") {
+                res.redirect("/admin-dashboard");
+            } else {
+                res.redirect("/dashboard");
+            }
+        });
+    } catch (error) {
+        console.error("Shared login limiter unavailable.");
+        return res.status(503).send("Sign-in is temporarily unavailable.");
     }
-
-    const passwordMatch = bcrypt.compareSync(password, user.password);
-
-    if (!passwordMatch) {
-        return res.send("Invalid email or password.");
-    }
-
-    req.session.userId = user.id;
-req.session.userName = user.name;
-req.session.userRole = user.role;
-
-if (user.role === "admin") {
-    res.redirect("/admin-dashboard");
-} else {
-    res.redirect("/dashboard");
-}
 });
 // Logout
-app.get("/logout", (req, res) => {
+app.post("/logout", csrfProtection, (req, res) => {
+    const auditContext = req.session.userRole === "admin"
+        ? {
+            actorUserId: req.session.userId,
+            actorRole: "admin",
+            eventType: "admin.logout",
+            req
+        }
+        : null;
+    if (auditContext) {
+        try {
+            writeAuditLog(auditContext);
+        } catch (error) {
+            console.error("Audit logging failed.");
+        }
+    }
     req.session.destroy((error) => {
         if (error) {
-            console.error(error);
+            console.error("Session destruction failed.");
             return res.send("Could not log out.");
         }
 
+        res.clearCookie("connect.sid", {
+            httpOnly: sessionCookieOptions.httpOnly,
+            secure: sessionCookieOptions.secure,
+            sameSite: sessionCookieOptions.sameSite
+        });
         res.redirect("/signin");
     });
 });
 // Process Sign Up
-app.post("/signup", (req, res) => {
-    const { name, email, password, confirmPassword } = req.body;
+app.post("/signup", csrfProtection, (req, res) => {
+    const name = boundedText(req.body.name, MAX_NAME_LENGTH);
+    const email = normalizedEmail(req.body.email);
+    const password = typeof req.body.password === "string" ? req.body.password : "";
+    const confirmPassword = typeof req.body.confirmPassword === "string"
+        ? req.body.confirmPassword
+        : "";
 
-    if (!name || !email || !password || !confirmPassword) {
-    return res.send("Please fill in all required fields.");
-}
+    if (!name || !email || password.length < 6 || password.length > MAX_PASSWORD_LENGTH) {
+        return res.status(400).send("Please provide valid account information.");
+    }
+    if (password !== confirmPassword) {
+        return res.status(400).send("Passwords do not match.");
+    }
 
-if (password !== confirmPassword) {
-    return res.send("Passwords do not match.");
-}
-
-if (password.length < 6) {
-    return res.send("Password must be at least 6 characters long.");
-}
     const hashedPassword = bcrypt.hashSync(password, 10);
 
     try {
@@ -929,7 +1373,35 @@ if (password.length < 6) {
     }
 });
 
-// Start server
-app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Micro-Loan Tracker running at http://localhost:${PORT}`);
+app.use((error, req, res, next) => {
+    if (error?.type === "entity.too.large" || error?.status === 413) {
+        return res.status(413).send("Request is too large.");
+    }
+    console.error("Unhandled request error.");
+    return res.status(500).send("Something went wrong while processing the request.");
 });
+
+// Start server when executed directly. Tests can import the app without binding a port.
+if (require.main === module) {
+    redisReady.then(() => {
+        app.listen(PORT, "0.0.0.0", () => {
+            console.log(`Micro-Loan Tracker running at http://localhost:${PORT}`);
+        });
+    }).catch(() => {
+        console.error("Micro-Loan Tracker could not initialize its shared Redis store.");
+        process.exitCode = 1;
+    });
+}
+
+module.exports = {
+    app,
+    db,
+    redisClient,
+    redisReady,
+    escapeHtml,
+    isProduction,
+    sessionCookieOptions,
+    validateSessionSecret,
+    securityHeaders,
+    shouldUseHsts
+};

@@ -16,6 +16,10 @@
             <a href="/">Home</a>
             <a href="/dashboard">Dashboard</a>
             <a href="/my-loans">My Loans</a>
+            <form action="/logout" method="POST">
+                <!-- CSRF_TOKEN -->
+                <button type="submit">Logout</button>
+            </form>
         </nav>
     </header>
 
@@ -28,6 +32,7 @@
         <h3>Record a Repayment</h3>
 
         <form action="/repayments" method="POST">
+            <!-- CSRF_TOKEN -->
 
             <label for="loanId">Loan ID</label><br>
             <input

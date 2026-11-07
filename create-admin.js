@@ -1,24 +1,32 @@
 require("dotenv").config();
 
 const fs = require("fs");
-fs.mkdirSync("./database", { recursive: true });
-
+const path = require("path");
 const Database = require("better-sqlite3");
 const bcrypt = require("bcryptjs");
 
-const db = new Database("./database/microloan.db");
-
+const databasePath = process.env.DATABASE_PATH || "./database/microloan.db";
 const name = "Micro-Loan Admin";
-const email = process.env.ADMIN_EMAIL;
+const email = typeof process.env.ADMIN_EMAIL === "string"
+    ? process.env.ADMIN_EMAIL.trim().toLowerCase()
+    : "";
 const password = process.env.ADMIN_PASSWORD;
 
-if (!email || !password) {
-    console.error("ADMIN_EMAIL or ADMIN_PASSWORD is missing.");
+function validEmail(value) {
+    return value.length >= 3 &&
+        value.length <= 254 &&
+        /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
+
+if (!validEmail(email) || typeof password !== "string" || password.length < 6 || password.length > 128) {
+    console.error("ADMIN_EMAIL and ADMIN_PASSWORD must be valid administrator credentials.");
     process.exit(1);
 }
 
+fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+const db = new Database(databasePath);
+
 try {
-    // Create users table if it does not already exist
     db.prepare(`
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,50 +36,59 @@ try {
             role TEXT NOT NULL DEFAULT 'borrower'
         )
     `).run();
+    db.prepare(`
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_user_id INTEGER,
+            actor_role TEXT,
+            event_type TEXT NOT NULL,
+            target_type TEXT,
+            target_id INTEGER,
+            metadata TEXT,
+            ip_hash TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (actor_user_id) REFERENCES users(id)
+        )
+    `).run();
 
-    const hashedPassword = bcrypt.hashSync(password, 10);
-
-    const existingAdmin = db.prepare(`
-        SELECT id FROM users WHERE email = ?
+    const existingUser = db.prepare(`
+        SELECT id, role
+        FROM users
+        WHERE lower(email) = lower(?)
     `).get(email);
 
-    if (existingAdmin) {
-
-        const updateAdmin = db.prepare(`
-            UPDATE users
-            SET name = ?, password = ?, role = ?
-            WHERE email = ?
-        `);
-
-        updateAdmin.run(
-            name,
-            hashedPassword,
-            "admin",
-            email
-        );
-
-        console.log("Admin account updated successfully.");
-
+    if (existingUser) {
+        if (existingUser.role !== "admin") {
+            console.error("Administrator bootstrap stopped: the configured email belongs to a non-administrator account.");
+            process.exitCode = 1;
+        } else {
+            console.log("Administrator already exists; no changes made.");
+        }
     } else {
-
-        const createAdmin = db.prepare(`
-            INSERT INTO users (name, email, password, role)
-            VALUES (?, ?, ?, ?)
-        `);
-
-        createAdmin.run(
-            name,
-            email,
-            hashedPassword,
-            "admin"
-        );
-
-        console.log("Admin account created successfully.");
+        const hashedPassword = bcrypt.hashSync(password, 10);
+        db.transaction(() => {
+            const result = db.prepare(`
+                INSERT INTO users (name, email, password, role)
+                VALUES (?, ?, ?, ?)
+            `).run(name, email, hashedPassword, "admin");
+            db.prepare(`
+                INSERT INTO audit_logs (
+                    actor_user_id, actor_role, event_type, target_type, target_id, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            `).run(
+                result.lastInsertRowid,
+                "admin",
+                "admin.bootstrap.create",
+                "user",
+                result.lastInsertRowid,
+                JSON.stringify({ source: "bootstrap" })
+            );
+        })();
+        console.log("Administrator account created successfully.");
     }
-
 } catch (error) {
-    console.error("Error creating admin:", error);
-    process.exit(1);
+    console.error("Administrator bootstrap failed.");
+    process.exitCode = 1;
 } finally {
     db.close();
 }
