@@ -3,6 +3,9 @@ const express = require("express");
 const crypto = require("crypto");
 const path = require("path");
 const Database = require("better-sqlite3");
+const { createPostgresDatabase } = require("./lib/postgres");
+const { createRepaymentRepository } = require("./lib/repayment-repository");
+const { createDataRepository } = require("./lib/data-repository");
 const bcrypt = require("bcryptjs");
 const session = require("express-session");
 const { RedisStore } = require("connect-redis");
@@ -284,7 +287,7 @@ function authenticatedCacheControl(req, res, next) {
     next();
 }
 
-function requireAdmin(req, res, next) {
+async function requireAdmin(req, res, next) {
     if (!req.session.userId) {
         return res.redirect("/signin");
     }
@@ -308,9 +311,14 @@ function requireAdmin(req, res, next) {
 
 const fs = require("fs");
 const databasePath = process.env.DATABASE_PATH || "./database/microloan.db";
-fs.mkdirSync(path.dirname(databasePath), { recursive: true });
-
-const db = new Database(databasePath);
+const postgresDb = createPostgresDatabase();
+const db = postgresDb ? null : (() => {
+    fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+    return new Database(databasePath);
+})();
+const postgresReady = postgresDb ? postgresDb.initializeSchema() : Promise.resolve();
+const repaymentRepository = createRepaymentRepository({ sqliteDb: db, postgres: postgresDb });
+const dataRepository = createDataRepository({ sqliteDb: db, postgres: postgresDb, sessionSecret });
 app.use(express.urlencoded({ extended: false, limit: MAX_REQUEST_BODY }));
 app.use(securityHeaders);
 app.use(requireRedisAvailability);
@@ -327,8 +335,7 @@ app.use(session({
 }));
 app.use(ensureCsrfToken);
 app.use(authenticatedCacheControl);
-// Create Users table
-db.exec(`
+if (!postgresDb) db.exec(`
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
@@ -338,8 +345,7 @@ db.exec(`
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
 `);
-// Create Loans table
-db.exec(`
+if (!postgresDb) db.exec(`
     CREATE TABLE IF NOT EXISTS loans (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -353,8 +359,7 @@ db.exec(`
         FOREIGN KEY (user_id) REFERENCES users(id)
     )
 `);
-// Create Repayments table
-db.exec(`
+if (!postgresDb) db.exec(`
     CREATE TABLE IF NOT EXISTS repayments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         loan_id INTEGER NOT NULL,
@@ -365,7 +370,7 @@ db.exec(`
         FOREIGN KEY (user_id) REFERENCES users(id)
     )
 `);
-db.exec(`
+if (!postgresDb) db.exec(`
     CREATE TABLE IF NOT EXISTS audit_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         actor_user_id INTEGER,
@@ -380,68 +385,16 @@ db.exec(`
     )
 `);
 
-function writeAuditLog({
-    actorUserId = null,
-    actorRole = null,
-    eventType,
-    targetType = null,
-    targetId = null,
-    metadata = null,
-    req = null
-}) {
-    if (!AUDIT_EVENT_TYPES.has(eventType)) {
-        throw new Error("Unsupported audit event type.");
-    }
-    const safeMetadata = metadata === null ? null : JSON.stringify(metadata);
-    const ipHash = req?.ip
-        ? crypto.createHash("sha256")
-            .update(`${sessionSecret}:${req.ip}`)
-            .digest("hex")
-        : null;
-    db.prepare(`
-        INSERT INTO audit_logs (
-            actor_user_id,
-            actor_role,
-            event_type,
-            target_type,
-            target_id,
-            metadata,
-            ip_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
-        actorUserId,
-        actorRole,
-        eventType,
-        targetType,
-        targetId,
-        safeMetadata,
-        ipHash
-    );
+async function writeAuditLog(options) {
+    if (!AUDIT_EVENT_TYPES.has(options.eventType)) throw new Error("Unsupported audit event type.");
+    return dataRepository.writeAuditLog(options);
 }
 
-function transitionLoanStatus({ loanId, nextStatus, actorUserId, req }) {
-    const eventType = nextStatus === "Approved"
-        ? "admin.loan.approve"
-        : "admin.loan.reject";
-    return db.transaction(() => {
-        const result = db.prepare(`
-            UPDATE loans
-            SET status = ?
-            WHERE id = ? AND status = 'Pending'
-        `).run(nextStatus, loanId);
-        if (result.changes !== 1) {
-            return false;
-        }
-        writeAuditLog({
-            actorUserId,
-            actorRole: "admin",
-            eventType,
-            targetType: "loan",
-            targetId: loanId,
-            req
-        });
-        return true;
-    })();
+async function transitionLoanStatus({ loanId, nextStatus, actorUserId, req }) {
+    return dataRepository.transitionLoanStatus({
+        loanId, nextStatus, actorUserId, req,
+        eventType: nextStatus === "Approved" ? "admin.loan.approve" : "admin.loan.reject"
+    });
 }
 // Serve files from the public folder
 app.use(express.static(path.join(__dirname, "public")));
@@ -460,25 +413,13 @@ app.get("/signin", (req, res) => {
     res.send(renderCsrfPage(path.join(__dirname, "views", "signin.html"), req));
 });
 // Borrower Dashboard
-app.get("/dashboard", (req, res) => {
+app.get("/dashboard", async (req, res) => {
         if (!req.session.userId) {
         return res.redirect("/signin");
     }
 
-    const loans = db.prepare(`
-        SELECT *
-        FROM loans
-        WHERE user_id = ?
-        ORDER BY created_at DESC
-    `).all(req.session.userId);
-const repaymentSummary = db.prepare(`
-    SELECT
-        loan_id,
-        COALESCE(SUM(amount), 0) AS total_repaid
-    FROM repayments
-    WHERE user_id = ?
-    GROUP BY loan_id
-`).all(req.session.userId);
+    const loans = await dataRepository.listUserLoans(req.session.userId);
+const repaymentSummary = await dataRepository.repaymentSummary(req.session.userId);
 
 let repaymentSummaryText = "";
 
@@ -605,17 +546,9 @@ dashboard = dashboard.replace(
 });
 
 // Admin Dashboard
-app.get("/admin-dashboard", requireAdmin, (req, res) => {
+app.get("/admin-dashboard", requireAdmin, async (req, res) => {
 
-    const loans = db.prepare(`
-        SELECT
-            loans.*,
-            users.name AS borrower_name,
-            users.email AS borrower_email
-        FROM loans
-        JOIN users ON loans.user_id = users.id
-        ORDER BY loans.created_at DESC
-    `).all();
+    const loans = await dataRepository.adminLoans();
     const totalLoans = loans.length;
 
 const approvedLoans = loans.filter(
@@ -635,12 +568,7 @@ const totalLoanAmount = loans.reduce(
     0
 );
 
-const repaymentSummary = db.prepare(`
-    SELECT COALESCE(SUM(amount), 0) AS total_repaid
-    FROM repayments
-`).get();
-
-const totalRepaid = repaymentSummary.total_repaid;
+const totalRepaid = await dataRepository.totalRepaid();
 
 const totalRepaymentAmount = loans.reduce(
     (total, loan) => total + loan.total_repayment,
@@ -741,18 +669,18 @@ const outstandingBalance = Math.max(
 
 
 // Approve Loan
-app.post("/admin/approve-loan/:id", requireAdmin, csrfProtection, (req, res) => {
+app.post("/admin/approve-loan/:id", requireAdmin, csrfProtection, async (req, res) => {
     const loanId = Number(req.params.id);
     if (!Number.isSafeInteger(loanId) || loanId <= 0) {
         return res.status(400).send("Invalid loan.");
     }
     try {
-        if (!transitionLoanStatus({
+        if (!(await transitionLoanStatus({
             loanId,
             nextStatus: "Approved",
             actorUserId: req.session.userId,
             req
-        })) {
+        }))) {
             return res.status(409).send("Loan is no longer pending or could not be found.");
         }
         res.redirect("/admin-dashboard");
@@ -764,18 +692,18 @@ app.post("/admin/approve-loan/:id", requireAdmin, csrfProtection, (req, res) => 
 
 
 // Reject Loan
-app.post("/admin/reject-loan/:id", requireAdmin, csrfProtection, (req, res) => {
+app.post("/admin/reject-loan/:id", requireAdmin, csrfProtection, async (req, res) => {
     const loanId = Number(req.params.id);
     if (!Number.isSafeInteger(loanId) || loanId <= 0) {
         return res.status(400).send("Invalid loan.");
     }
     try {
-        if (!transitionLoanStatus({
+        if (!(await transitionLoanStatus({
             loanId,
             nextStatus: "Rejected",
             actorUserId: req.session.userId,
             req
-        })) {
+        }))) {
             return res.status(409).send("Loan is no longer pending or could not be found.");
         }
         res.redirect("/admin-dashboard");
@@ -786,26 +714,14 @@ app.post("/admin/reject-loan/:id", requireAdmin, csrfProtection, (req, res) => {
 });
 
 // My Loans page
-app.get("/my-loans", (req, res) => {
+app.get("/my-loans", async (req, res) => {
     if (!req.session.userId) {
         return res.redirect("/signin");
     }
 
-    const loans = db.prepare(`
-        SELECT *
-        FROM loans
-        WHERE user_id = ?
-        ORDER BY created_at DESC
-    `).all(req.session.userId);
+    const loans = await dataRepository.listUserLoans(req.session.userId);
 
-    const repaymentSummary = db.prepare(`
-        SELECT
-            loan_id,
-            COALESCE(SUM(amount), 0) AS total_repaid
-        FROM repayments
-        WHERE user_id = ?
-        GROUP BY loan_id
-    `).all(req.session.userId);
+    const repaymentSummary = await dataRepository.repaymentSummary(req.session.userId);
 
     let loanList = "";
 
@@ -916,28 +832,14 @@ app.get("/my-loans", (req, res) => {
     res.send(loansPage);
 });
 // Repayments page
-app.get("/repayments", (req, res) => {
+app.get("/repayments", async (req, res) => {
         if (!req.session.userId) {
         return res.redirect("/signin");
     }
 
-    const loans = db.prepare(`
-        SELECT *
-        FROM loans
-        WHERE user_id = ?
-        ORDER BY created_at DESC
-    `).all(req.session.userId);
+    const loans = await dataRepository.listUserLoans(req.session.userId);
 
-    const repaymentRecords = db.prepare(`
-        SELECT
-            repayments.*,
-            loans.amount AS loan_amount,
-            loans.total_repayment
-        FROM repayments
-        JOIN loans ON repayments.loan_id = loans.id
-        WHERE repayments.user_id = ?
-        ORDER BY repayments.payment_date DESC
-    `).all(req.session.userId);
+    const repaymentRecords = await dataRepository.repaymentRecords(req.session.userId);
 
     let repaymentSummary = "";
 
@@ -1062,7 +964,7 @@ app.get("/repayments", (req, res) => {
     res.send(repaymentsPage);
 });
 // Process Repayment
-app.post("/repayments", csrfProtection, (req, res) => {
+app.post("/repayments", csrfProtection, async (req, res) => {
     if (!req.session.userId) {
         return res.redirect("/signin");
     }
@@ -1073,6 +975,27 @@ app.post("/repayments", csrfProtection, (req, res) => {
         return res.status(400).send("Please provide a valid repayment amount and loan ID.");
     }
 
+    if (postgresDb) {
+        try {
+            await postgresReady;
+            const result = await repaymentRepository.record({
+                loanId,
+                userId: req.session.userId,
+                amount: repaymentAmount,
+                idempotencyKey: req.get("Idempotency-Key") || req.body.idempotencyKey || null
+            });
+            if (result.reason === "not_found") return res.send("Loan not found.");
+            if (result.reason === "idempotency_conflict") return res.status(409).send("Idempotency key was already used for a different repayment.");
+            if (result.reason === "not_approved") return res.send(`This loan is not approved for repayment.<br><br>Loan Status: <strong>${escapeHtml(result.loan.status)}</strong><br><br><a href="/repayments">Back to Repayments</a>`);
+            if (result.reason === "overpayment") return res.send(`Repayment amount is greater than the remaining balance.<br><br>Remaining balance: ₦${escapeHtml(result.remainingBalance.toLocaleString())}<br><br><a href="/repayments">Back to Repayments</a>`);
+            if (result.reason === "invalid_amount") return res.status(400).send("Please provide a valid repayment amount and loan ID.");
+            const remaining = result.remainingBalance === null ? "already recorded" : result.remainingBalance.toLocaleString();
+            return res.send(`<h1>Repayment Recorded Successfully!</h1><p>Loan ID: ${escapeHtml(loanId)}</p><p>Repayment Amount: ₦${escapeHtml(repaymentAmount.toLocaleString())}</p><p>Remaining Balance: ₦${escapeHtml(remaining)}</p><br><a href="/repayments">View Repayments</a><br><br><a href="/dashboard">Back to Dashboard</a>`);
+        } catch (error) {
+            console.error("PostgreSQL repayment failed.");
+            return res.status(503).send("Database service is temporarily unavailable.");
+        }
+    }
     const loan = db.prepare(`
         SELECT *
         FROM loans
@@ -1163,7 +1086,7 @@ app.post("/repayments", csrfProtection, (req, res) => {
     }
 });
 // Loan Request page
-app.get("/request-loan", (req, res) => {
+app.get("/request-loan", async (req, res) => {
     if (!req.session.userId) {
         return res.redirect("/signin");
     }
@@ -1171,7 +1094,7 @@ app.get("/request-loan", (req, res) => {
     res.send(renderCsrfPage(path.join(__dirname, "views", "request-loan.html"), req));
 });
 // Process Loan Request
-app.post("/request-loan", csrfProtection, (req, res) => {
+app.post("/request-loan", csrfProtection, async (req, res) => {
     if (!req.session.userId) {
         return res.redirect("/signin");
     }
@@ -1186,26 +1109,7 @@ app.post("/request-loan", csrfProtection, (req, res) => {
     const totalRepayment = loanAmount + interestAmount;
 
     try {
-        const insertLoan = db.prepare(`
-            INSERT INTO loans (
-                user_id,
-                amount,
-                interest_rate,
-                interest_amount,
-                total_repayment,
-                purpose
-            )
-            VALUES (?, ?, ?, ?, ?, ?)
-        `);
-
-        insertLoan.run(
-            req.session.userId,
-            loanAmount,
-            rate,
-            interestAmount,
-           totalRepayment,
-            cleanPurpose
-        );
+        await dataRepository.createLoan({ userId: req.session.userId, amount: loanAmount, rate, interestAmount, totalRepayment, purpose: cleanPurpose });
 
         res.send(`
             <h1>Loan Request Submitted Successfully!</h1>
@@ -1233,9 +1137,7 @@ app.post("/signin", csrfProtection, async (req, res) => {
         }
 
         const user = email && password.length <= MAX_PASSWORD_LENGTH
-            ? db.prepare(`
-                SELECT * FROM users WHERE lower(email) = lower(?)
-            `).get(email)
+            ? await dataRepository.findUserByEmail(email)
             : null;
 
         if (!user) {
@@ -1250,7 +1152,7 @@ app.post("/signin", csrfProtection, async (req, res) => {
         if (!passwordMatch) {
             if (user.role === "admin") {
                 try {
-                    writeAuditLog({
+                    await writeAuditLog({
                         actorUserId: user.id,
                         actorRole: "admin",
                         eventType: "admin.signin.failure",
@@ -1269,7 +1171,7 @@ app.post("/signin", csrfProtection, async (req, res) => {
 
         await clearLoginFailures(rateLimitKey);
 
-        req.session.regenerate((error) => {
+        req.session.regenerate(async (error) => {
             if (error) {
                 console.error("Session regeneration failed.");
                 return res.send("Could not sign in.");
@@ -1282,7 +1184,7 @@ app.post("/signin", csrfProtection, async (req, res) => {
 
             if (user.role === "admin") {
                 try {
-                    writeAuditLog({
+                    await writeAuditLog({
                         actorUserId: user.id,
                         actorRole: "admin",
                         eventType: "admin.signin.success",
@@ -1306,7 +1208,7 @@ app.post("/signin", csrfProtection, async (req, res) => {
     }
 });
 // Logout
-app.post("/logout", csrfProtection, (req, res) => {
+app.post("/logout", csrfProtection, async (req, res) => {
     const auditContext = req.session.userRole === "admin"
         ? {
             actorUserId: req.session.userId,
@@ -1317,7 +1219,7 @@ app.post("/logout", csrfProtection, (req, res) => {
         : null;
     if (auditContext) {
         try {
-            writeAuditLog(auditContext);
+            await writeAuditLog(auditContext);
         } catch (error) {
             console.error("Audit logging failed.");
         }
@@ -1337,7 +1239,7 @@ app.post("/logout", csrfProtection, (req, res) => {
     });
 });
 // Process Sign Up
-app.post("/signup", csrfProtection, (req, res) => {
+app.post("/signup", csrfProtection, async (req, res) => {
     const name = boundedText(req.body.name, MAX_NAME_LENGTH);
     const email = normalizedEmail(req.body.email);
     const password = typeof req.body.password === "string" ? req.body.password : "";
@@ -1355,16 +1257,11 @@ app.post("/signup", csrfProtection, (req, res) => {
     const hashedPassword = bcrypt.hashSync(password, 10);
 
     try {
-        const insertUser = db.prepare(`
-            INSERT INTO users (name, email, password)
-            VALUES (?, ?, ?)
-        `);
-
-        insertUser.run(name, email, hashedPassword);
+        await dataRepository.createUser({ name, email, password: hashedPassword });
 
         res.send("Account created successfully!");
     } catch (error) {
-        if (error.code === "SQLITE_CONSTRAINT_UNIQUE") {
+        if (error.code === "SQLITE_CONSTRAINT_UNIQUE" || error.code === "ACCOUNT_EXISTS" || error.code === "23505") {
             return res.send("An account with this email already exists.");
         }
 
@@ -1383,7 +1280,13 @@ app.use((error, req, res, next) => {
 
 // Start server when executed directly. Tests can import the app without binding a port.
 if (require.main === module) {
-    redisReady.then(() => {
+    const shutdown = async () => {
+        if (postgresDb) await postgresDb.close();
+        await redisClient.quit().catch(() => {});
+    };
+    process.once("SIGTERM", shutdown);
+    process.once("SIGINT", shutdown);
+    Promise.all([redisReady, postgresReady]).then(() => {
         app.listen(PORT, "0.0.0.0", () => {
             console.log(`Micro-Loan Tracker running at http://localhost:${PORT}`);
         });
@@ -1398,6 +1301,8 @@ module.exports = {
     db,
     redisClient,
     redisReady,
+    postgresDb,
+    postgresReady,
     escapeHtml,
     isProduction,
     sessionCookieOptions,
