@@ -8,6 +8,7 @@
 </head>
 
 <body>
+<div id="prototype-notice">Prototype/demo: local disposable data only; temporary resources may expire.</div>
 
     <header>
         <h1>Micro-Loan Tracker</h1>
@@ -17,7 +18,10 @@
 <a href="/dashboard">Dashboard</a>
 <a href="/my-loans">My Loans</a>
 <a href="/repayments">Repayments</a>
-<a href="/logout">Logout</a>
+<form action="/logout" method="POST">
+    <!-- CSRF_TOKEN -->
+    <button type="submit">Logout</button>
+</form>
         </nav>
     </header>
 

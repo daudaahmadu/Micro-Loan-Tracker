@@ -8,6 +8,7 @@
 </head>
 
 <body>
+<div id="prototype-notice">Prototype/demo: local disposable data only; temporary resources may expire.</div>
 
     <header>
         <h1>Micro-Loan Tracker</h1>
@@ -15,6 +16,10 @@
         <nav>
             <a href="/">Home</a>
             <a href="/dashboard">Dashboard</a>
+            <form action="/logout" method="POST">
+                <!-- CSRF_TOKEN -->
+                <button type="submit">Logout</button>
+            </form>
         </nav>
     </header>
 
@@ -25,6 +30,7 @@
         <p>Complete the form below to submit your loan request.</p>
 
         <form action="/request-loan" method="POST">
+            <!-- CSRF_TOKEN -->
 
             <label for="amount">Loan Amount (₦)</label><br>
             <input

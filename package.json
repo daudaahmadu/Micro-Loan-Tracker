@@ -3,10 +3,11 @@
   "version": "1.0.0",
   "description": "",
   "main": "server.js",
-"scripts": {
-  "start": "node create-admin.js && node server.js",
-  "test": "echo \"Error: no test specified\" && exit 1"
-},
+  "scripts": {
+    "start": "node create-admin.js && node server.js",
+    "test": "node --test test/*.test.js",
+    "rotate-admin-password": "node rotate-admin-password.js"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -14,8 +15,12 @@
   "dependencies": {
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^13.0.3",
+    "connect-redis": "^10.0.0",
+    "decimal.js": "^10.6.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "express-session": "^1.19.0"
+    "express-session": "^1.19.0",
+    "pg": "^8.23.1",
+    "redis": "^6.3.1"
   }
 }
