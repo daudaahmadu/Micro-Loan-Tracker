@@ -6,6 +6,7 @@ const Database = require("better-sqlite3");
 const { createPostgresDatabase } = require("./lib/postgres");
 const { createRepaymentRepository } = require("./lib/repayment-repository");
 const { createDataRepository } = require("./lib/data-repository");
+const { Decimal, decimalString, formatNgn, nonNegative } = require("./lib/decimal");
 const bcrypt = require("bcryptjs");
 const session = require("express-session");
 const { RedisStore } = require("connect-redis");
@@ -43,7 +44,9 @@ const AUDIT_EVENT_TYPES = new Set([
     "admin.loan.approve",
     "admin.loan.reject",
     "admin.password.rotate",
-    "admin.bootstrap.create"
+    "admin.bootstrap.create",
+    "loan.create",
+    "repayment.create"
 ]);
 function validateRedisUrl(value) {
     if (typeof value !== "string" || value.trim() === "") {
@@ -193,19 +196,16 @@ function boundedText(value, maxLength) {
     return text.length > 0 && text.length <= maxLength ? text : null;
 }
 
-function numericField(value, maximum) {
-    if (typeof value !== "string" || value.trim() === "") {
-        return null;
-    }
-    const number = Number(value);
-    return Number.isFinite(number) && number >= 0 && number <= maximum
-        ? number
-        : null;
+function numericField(value, maximum, { allowZero = true } = {}) {
+    return decimalString(value, {
+        positive: true,
+        max: maximum,
+        allowZero
+    });
 }
 
 function positiveNumericField(value, maximum) {
-    const number = numericField(value, maximum);
-    return number !== null && number > 0 ? number : null;
+    return numericField(value, maximum, { allowZero: false });
 }
 
 function positiveInteger(value) {
@@ -253,6 +253,9 @@ async function clearLoginFailures(key) {
 }
 
 function requireRedisAvailability(req, res, next) {
+    if (req.path === "/health/ready") {
+        return next();
+    }
     if (!redisClient.isReady) {
         return res.status(503).send("Shared session service is temporarily unavailable.");
     }
@@ -294,7 +297,7 @@ async function requireAdmin(req, res, next) {
 
     if (req.session.userRole !== "admin") {
         try {
-            writeAuditLog({
+            await writeAuditLog({
                 actorUserId: req.session.userId,
                 actorRole: req.session.userRole,
                 eventType: "admin.authorization.denied",
@@ -311,6 +314,7 @@ async function requireAdmin(req, res, next) {
 
 const fs = require("fs");
 const databasePath = process.env.DATABASE_PATH || "./database/microloan.db";
+if (isProduction && (!process.env.DATABASE_URL || !process.env.DATABASE_URL.trim())) throw new Error("DATABASE_URL must be configured in production; refusing SQLite fallback.");
 const postgresDb = createPostgresDatabase();
 const db = postgresDb ? null : (() => {
     fs.mkdirSync(path.dirname(databasePath), { recursive: true });
@@ -396,6 +400,14 @@ async function transitionLoanStatus({ loanId, nextStatus, actorUserId, req }) {
         eventType: nextStatus === "Approved" ? "admin.loan.approve" : "admin.loan.reject"
     });
 }
+app.get("/health/ready", async (req, res) => {
+    let database = false;
+    try { await postgresReady; if (postgresDb) await postgresDb.query("SELECT 1"); else db.prepare("SELECT 1").get(); database = true; } catch {}
+    const redis = Boolean(redisClient.isReady);
+    const ready = database && redis;
+    res.status(ready ? 200 : 503).json({ ready, database, redis });
+});
+
 // Serve files from the public folder
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -441,18 +453,17 @@ if (loans.length === 0) {
 
         const totalRepayment = loan.total_repayment;
 
-        const remainingBalance = Math.max(
-            totalRepayment - totalRepaid,
-            0
+        const remainingBalance = nonNegative(
+            new Decimal(totalRepayment).minus(totalRepaid).toString()
         );
 
         let repaymentStatus = "Unpaid";
 
-        if (totalRepaid > 0 && remainingBalance > 0) {
+        if (new Decimal(String(totalRepaid)).gt(0) && new Decimal(String(remainingBalance)).gt(0)) {
             repaymentStatus = "Partially Paid";
         }
 
-        if (remainingBalance === 0 && totalRepaid > 0) {
+        if (new Decimal(String(remainingBalance)).isZero() && new Decimal(String(totalRepaid)).gt(0)) {
             repaymentStatus = "Fully Paid";
         }
 
@@ -465,11 +476,11 @@ if (loans.length === 0) {
                 </p>
 
                 <p>Total Repaid:
-                    ₦${escapeHtml(totalRepaid.toLocaleString())}
+                    ₦${escapeHtml(formatNgn(totalRepaid))}
                 </p>
 
                 <p>Remaining Balance:
-                    ₦${escapeHtml(remainingBalance.toLocaleString())}
+                    ₦${escapeHtml(formatNgn(remainingBalance))}
                 </p>
 
                 <hr>
@@ -486,10 +497,10 @@ let loanList = "";
         loanList = loans.map(loan => `
             <div>
                 <h4>Loan #${escapeHtml(loan.id)}</h4>
-                <p>Amount: ₦${escapeHtml(loan.amount.toLocaleString())}</p>
+                <p>Amount: ₦${escapeHtml(formatNgn(loan.amount))}</p>
                 <p>Interest Rate: ${escapeHtml(loan.interest_rate)}%</p>
-                <p>Interest: ₦${escapeHtml(loan.interest_amount.toLocaleString())}</p>
-                <p>Total Repayment: ₦${escapeHtml(loan.total_repayment.toLocaleString())}</p>
+                <p>Interest: ₦${escapeHtml(formatNgn(loan.interest_amount))}</p>
+                <p>Total Repayment: ₦${escapeHtml(formatNgn(loan.total_repayment))}</p>
                 <p>Purpose: ${escapeHtml(loan.purpose)}</p>
                 <p>Status: <strong>${escapeHtml(loan.status)}</strong></p>
                 <hr>
@@ -563,22 +574,13 @@ const rejectedLoans = loans.filter(
     loan => loan.status === "Rejected"
 ).length;
 
-const totalLoanAmount = loans.reduce(
-    (total, loan) => total + loan.amount,
-    0
-);
+const totalLoanAmount = loans.reduce((total, loan) => new Decimal(total).plus(loan.amount), new Decimal(0)).toString();
 
 const totalRepaid = await dataRepository.totalRepaid();
 
-const totalRepaymentAmount = loans.reduce(
-    (total, loan) => total + loan.total_repayment,
-    0
-);
+const totalRepaymentAmount = loans.reduce((total, loan) => new Decimal(total).plus(loan.total_repayment), new Decimal(0)).toString();
 
-const outstandingBalance = Math.max(
-    totalRepaymentAmount - totalRepaid,
-    0
-);
+const outstandingBalance = nonNegative(new Decimal(totalRepaymentAmount).minus(totalRepaid).toString());
 
     let loanRequests = "";
 
@@ -596,13 +598,13 @@ const outstandingBalance = Math.max(
 
                 <p>Email: ${escapeHtml(loan.borrower_email)}</p>
 
-                <p>Amount: ₦${escapeHtml(loan.amount.toLocaleString())}</p>
+                <p>Amount: ₦${escapeHtml(formatNgn(loan.amount))}</p>
 
                 <p>Interest Rate: ${escapeHtml(loan.interest_rate)}%</p>
 
-                <p>Interest: ₦${escapeHtml(loan.interest_amount.toLocaleString())}</p>
+                <p>Interest: ₦${escapeHtml(formatNgn(loan.interest_amount))}</p>
 
-                <p>Total Repayment: ₦${escapeHtml(loan.total_repayment.toLocaleString())}</p>
+                <p>Total Repayment: ₦${escapeHtml(formatNgn(loan.total_repayment))}</p>
 
                 <p>Purpose: ${escapeHtml(loan.purpose)}</p>
 
@@ -648,11 +650,11 @@ const outstandingBalance = Math.max(
 
     <p>Rejected Loans: <strong>${rejectedLoans}</strong></p>
 
-    <p>Total Loan Amount: <strong>₦${escapeHtml(totalLoanAmount.toLocaleString())}</strong></p>
+    <p>Total Loan Amount: <strong>₦${escapeHtml(formatNgn(totalLoanAmount))}</strong></p>
 
-    <p>Total Repaid: <strong>₦${escapeHtml(totalRepaid.toLocaleString())}</strong></p>
+    <p>Total Repaid: <strong>₦${escapeHtml(formatNgn(totalRepaid))}</strong></p>
 
-    <p>Outstanding Balance: <strong>₦${escapeHtml(outstandingBalance.toLocaleString())}</strong></p>
+    <p>Outstanding Balance: <strong>₦${escapeHtml(formatNgn(outstandingBalance))}</strong></p>
     `
 );
 
@@ -741,18 +743,15 @@ app.get("/my-loans", async (req, res) => {
                 ? repaymentRecord.total_repaid
                 : 0;
 
-            const remainingBalance = Math.max(
-                loan.total_repayment - totalRepaid,
-                0
-            );
+            const remainingBalance = nonNegative(new Decimal(loan.total_repayment).minus(totalRepaid).toString());
 
             let repaymentStatus = "Unpaid";
 
-            if (totalRepaid > 0 && remainingBalance > 0) {
+            if (new Decimal(String(totalRepaid)).gt(0) && new Decimal(String(remainingBalance)).gt(0)) {
                 repaymentStatus = "Partially Paid";
             }
 
-            if (remainingBalance === 0 && totalRepaid > 0) {
+            if (new Decimal(String(remainingBalance)).isZero() && new Decimal(String(totalRepaid)).gt(0)) {
                 repaymentStatus = "Fully Paid";
             }
 
@@ -762,7 +761,7 @@ app.get("/my-loans", async (req, res) => {
 
                     <p>
                         Amount:
-                        ₦${escapeHtml(loan.amount.toLocaleString())}
+                        ₦${escapeHtml(formatNgn(loan.amount))}
                     </p>
 
                     <p>
@@ -772,12 +771,12 @@ app.get("/my-loans", async (req, res) => {
 
                     <p>
                         Interest:
-                        ₦${escapeHtml(loan.interest_amount.toLocaleString())}
+                        ₦${escapeHtml(formatNgn(loan.interest_amount))}
                     </p>
 
                     <p>
                         Total Repayment:
-                        ₦${escapeHtml(loan.total_repayment.toLocaleString())}
+                        ₦${escapeHtml(formatNgn(loan.total_repayment))}
                     </p>
 
                     <p>
@@ -792,12 +791,12 @@ app.get("/my-loans", async (req, res) => {
 
                     <p>
                         Total Repaid:
-                        ₦${escapeHtml(totalRepaid.toLocaleString())}
+                        ₦${escapeHtml(formatNgn(totalRepaid))}
                     </p>
 
                     <p>
                         Remaining Balance:
-                        ₦${escapeHtml(remainingBalance.toLocaleString())}
+                        ₦${escapeHtml(formatNgn(remainingBalance))}
                     </p>
 
                     <p>
@@ -856,22 +855,19 @@ app.get("/repayments", async (req, res) => {
             );
 
             const totalRepaid = loanRepayments.reduce(
-                (total, repayment) => total + repayment.amount,
-                0
-            );
+                (total, repayment) => new Decimal(total).plus(repayment.amount),
+                new Decimal(0)
+            ).toString();
 
-            const remainingBalance = Math.max(
-                loan.total_repayment - totalRepaid,
-                0
-            );
+            const remainingBalance = nonNegative(new Decimal(loan.total_repayment).minus(totalRepaid).toString());
 
             let repaymentStatus = "Unpaid";
 
-            if (totalRepaid > 0 && remainingBalance > 0) {
+            if (new Decimal(String(totalRepaid)).gt(0) && new Decimal(String(remainingBalance)).gt(0)) {
                 repaymentStatus = "Partially Paid";
             }
 
-            if (remainingBalance === 0 && totalRepaid > 0) {
+            if (new Decimal(String(remainingBalance)).isZero() && new Decimal(String(totalRepaid)).gt(0)) {
                 repaymentStatus = "Fully Paid";
             }
 
@@ -891,7 +887,7 @@ app.get("/repayments", async (req, res) => {
 
                         <p>
                             Amount:
-                            ₦${escapeHtml(repayment.amount.toLocaleString())}
+                            ₦${escapeHtml(formatNgn(repayment.amount))}
                         </p>
 
                         <p>
@@ -910,12 +906,12 @@ app.get("/repayments", async (req, res) => {
 
                     <p>
                         Loan Amount:
-                        ₦${escapeHtml(loan.amount.toLocaleString())}
+                        ₦${escapeHtml(formatNgn(loan.amount))}
                     </p>
 
                     <p>
                         Total Repayment:
-                        ₦${escapeHtml(loan.total_repayment.toLocaleString())}
+                        ₦${escapeHtml(formatNgn(loan.total_repayment))}
                     </p>
 
                     <p>
@@ -925,12 +921,12 @@ app.get("/repayments", async (req, res) => {
 
                     <p>
                         Total Repaid:
-                        ₦${escapeHtml(totalRepaid.toLocaleString())}
+                        ₦${escapeHtml(formatNgn(totalRepaid))}
                     </p>
 
                     <p>
                         Remaining Balance:
-                        ₦${escapeHtml(remainingBalance.toLocaleString())}
+                        ₦${escapeHtml(formatNgn(remainingBalance))}
                     </p>
 
                     <h4>Payment Records</h4>
@@ -982,15 +978,16 @@ app.post("/repayments", csrfProtection, async (req, res) => {
                 loanId,
                 userId: req.session.userId,
                 amount: repaymentAmount,
-                idempotencyKey: req.get("Idempotency-Key") || req.body.idempotencyKey || null
+                idempotencyKey: req.get("Idempotency-Key") || req.body.idempotencyKey || null,
+                req
             });
             if (result.reason === "not_found") return res.send("Loan not found.");
             if (result.reason === "idempotency_conflict") return res.status(409).send("Idempotency key was already used for a different repayment.");
             if (result.reason === "not_approved") return res.send(`This loan is not approved for repayment.<br><br>Loan Status: <strong>${escapeHtml(result.loan.status)}</strong><br><br><a href="/repayments">Back to Repayments</a>`);
-            if (result.reason === "overpayment") return res.send(`Repayment amount is greater than the remaining balance.<br><br>Remaining balance: ₦${escapeHtml(result.remainingBalance.toLocaleString())}<br><br><a href="/repayments">Back to Repayments</a>`);
+            if (result.reason === "overpayment") return res.send(`Repayment amount is greater than the remaining balance.<br><br>Remaining balance: ₦${escapeHtml(formatNgn(result.remainingBalance))}<br><br><a href="/repayments">Back to Repayments</a>`);
             if (result.reason === "invalid_amount") return res.status(400).send("Please provide a valid repayment amount and loan ID.");
-            const remaining = result.remainingBalance === null ? "already recorded" : result.remainingBalance.toLocaleString();
-            return res.send(`<h1>Repayment Recorded Successfully!</h1><p>Loan ID: ${escapeHtml(loanId)}</p><p>Repayment Amount: ₦${escapeHtml(repaymentAmount.toLocaleString())}</p><p>Remaining Balance: ₦${escapeHtml(remaining)}</p><br><a href="/repayments">View Repayments</a><br><br><a href="/dashboard">Back to Dashboard</a>`);
+            const remaining = result.remainingBalance === null ? "already recorded" : formatNgn(result.remainingBalance);
+            return res.send(`<h1>Repayment Recorded Successfully!</h1><p>Loan ID: ${escapeHtml(loanId)}</p><p>Repayment Amount: ₦${escapeHtml(formatNgn(repaymentAmount))}</p><p>Remaining Balance: ₦${escapeHtml(remaining)}</p><br><a href="/repayments">View Repayments</a><br><br><a href="/dashboard">Back to Dashboard</a>`);
         } catch (error) {
             console.error("PostgreSQL repayment failed.");
             return res.status(503).send("Database service is temporarily unavailable.");
@@ -1027,15 +1024,14 @@ app.post("/repayments", csrfProtection, async (req, res) => {
         WHERE loan_id = ? AND user_id = ?
     `).get(loanId, req.session.userId);
 
-    const remainingBalance =
-        loan.total_repayment - previousRepayments.total_paid;
+    const remainingBalance = nonNegative(new Decimal(String(loan.total_repayment)).minus(String(previousRepayments.total_paid)).toString());
 
-    if (repaymentAmount > remainingBalance) {
+    if (new Decimal(String(repaymentAmount)).gt(remainingBalance)) {
         return res.send(`
             Repayment amount is greater than the remaining balance.
 
             <br><br>
-            Remaining balance: ₦${escapeHtml(remainingBalance.toLocaleString())}
+            Remaining balance: ₦${escapeHtml(formatNgn(remainingBalance))}
 
             <br><br>
             <a href="/repayments">Back to Repayments</a>
@@ -1064,11 +1060,11 @@ app.post("/repayments", csrfProtection, async (req, res) => {
             <p>Loan ID: ${escapeHtml(loanId)}</p>
 
             <p>Repayment Amount:
-                ₦${escapeHtml(repaymentAmount.toLocaleString())}
+                ₦${escapeHtml(formatNgn(repaymentAmount))}
             </p>
 
             <p>Remaining Balance:
-                ₦${escapeHtml((remainingBalance - repaymentAmount).toLocaleString())}
+                ₦${escapeHtml(formatNgn(new Decimal(remainingBalance).minus(repaymentAmount).toString()))}
             </p>
 
             <br>
@@ -1105,17 +1101,17 @@ app.post("/request-loan", csrfProtection, async (req, res) => {
     if (loanAmount === null || rate === null || cleanPurpose === null) {
         return res.status(400).send("Please provide valid loan information.");
     }
-    const interestAmount = loanAmount * (rate / 100);
-    const totalRepayment = loanAmount + interestAmount;
+    const interestAmount = new Decimal(loanAmount).times(rate).div(100).toString();
+    const totalRepayment = new Decimal(loanAmount).plus(interestAmount).toString();
 
     try {
-        await dataRepository.createLoan({ userId: req.session.userId, amount: loanAmount, rate, interestAmount, totalRepayment, purpose: cleanPurpose });
+        await dataRepository.createLoan({ userId: req.session.userId, amount: loanAmount, rate, interestAmount, totalRepayment, purpose: cleanPurpose, req });
 
         res.send(`
             <h1>Loan Request Submitted Successfully!</h1>
-            <p>Loan Amount: ₦${escapeHtml(loanAmount.toLocaleString())}</p>
-            <p>Interest: ₦${escapeHtml(interestAmount.toLocaleString())}</p>
-            <p>Total Repayment: ₦${escapeHtml(totalRepayment.toLocaleString())}</p>
+            <p>Loan Amount: ₦${escapeHtml(formatNgn(loanAmount))}</p>
+            <p>Interest: ₦${escapeHtml(formatNgn(interestAmount))}</p>
+            <p>Total Repayment: ₦${escapeHtml(formatNgn(totalRepayment))}</p>
             <p>Status: Pending</p>
             <a href="/dashboard">Back to Dashboard</a>
         `);

@@ -90,7 +90,7 @@ function runModuleWithEnvironment(overrides = {}, source = `
             maxAge: loaded.sessionCookieOptions.maxAge,
             trustProxy: loaded.app.get('trust proxy')
         }));
-        loaded.db.close();
+        loaded.db?.close();
         await loaded.redisClient.quit();
     }).catch(() => {
         process.exitCode = 1;
@@ -150,6 +150,7 @@ test("uses secure production cookie settings and trusts one Render proxy hop", (
     const result = runModuleWithEnvironment({
         SESSION_SECRET: productionSecret,
         DATABASE_PATH: path.join(temporaryDirectory, "production-config.sqlite"),
+        DATABASE_URL: "postgresql://ubuntu@/mlt_pg_test?host=/var/run/postgresql",
         NODE_ENV: "production",
         REDIS_URL: "rediss://127.0.0.1:6380/15"
     }, `
@@ -162,7 +163,7 @@ test("uses secure production cookie settings and trusts one Render proxy hop", (
             trustProxy: loaded.app.get('trust proxy')
         }));
         loaded.redisReady.catch(() => {});
-        loaded.db.close();
+        loaded.db?.close();
         loaded.redisClient.disconnect();
     `);
     assert.equal(result.status, 0, result.stderr);

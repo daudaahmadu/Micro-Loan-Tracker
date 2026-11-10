@@ -146,3 +146,4 @@ main section a[href="/request-loan"]:hover,
 main section a[href="/signin"]:hover {
     opacity: 0.9;
 }
+#prototype-notice { background: #fff3cd; color: #664d03; border: 1px solid #ffecb5; padding: .65rem 1rem; text-align: center; font-size: .9rem; }

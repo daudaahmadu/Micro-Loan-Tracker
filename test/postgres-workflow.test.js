@@ -163,7 +163,7 @@ test("PostgreSQL borrower and administrator HTTP workflows preserve financial an
         "SELECT event_type FROM audit_logs WHERE target_type='loan' AND target_id=$1 ORDER BY id",
         [loanId]
     );
-    assert.deepEqual(audit.rows.map(row => row.event_type), ["admin.loan.approve"]);
+    assert.deepEqual(audit.rows.map(row => row.event_type), ["loan.create", "admin.loan.approve"]);
 
     const logoutPage = await pageToken("/dashboard", borrowerCookie);
     const logout = await request("/logout", {
@@ -173,4 +173,69 @@ test("PostgreSQL borrower and administrator HTTP workflows preserve financial an
     });
     assert.equal(logout.response.status, 302);
     assert.equal(logout.response.headers.get("location"), "/signin");
+});
+
+test("HTTP loan validation preserves four-decimal precision and rejects invalid boundaries", { skip: !enabled }, async () => {
+    const suffix = `${Date.now()}-${process.pid}-precision`;
+    const email = `precision-borrower-${suffix}@example.test`;
+    const password = "Precision-Workflow-123!";
+    const signupPage = await pageToken("/signup");
+    const signup = await request("/signup", {
+        method: "POST",
+        headers: { cookie: signupPage.cookie },
+        body: body({
+            name: "Precision Borrower",
+            email,
+            password,
+            confirmPassword: password,
+            _csrf: signupPage.token
+        })
+    });
+    assert.equal(signup.response.status, 200);
+    const borrowerCookie = await login(email, password);
+
+    async function submitLoan(amount, interestRate, purpose) {
+        const page = await pageToken("/request-loan", borrowerCookie);
+        return request("/request-loan", {
+            method: "POST",
+            headers: { cookie: borrowerCookie },
+            body: body({ amount, interestRate, purpose, _csrf: page.token })
+        });
+    }
+
+    for (const [amount, interestRate, purpose] of [
+        ["1.23456", "5", "too many amount decimals"],
+        ["100", "5.12345", "too many rate decimals"],
+        ["not-a-number", "5", "invalid amount"],
+        ["-1", "5", "negative amount"],
+        ["100000000.0001", "5", "amount above maximum"],
+        ["100", "100.0001", "rate above maximum"]
+    ]) {
+        const result = await submitLoan(amount, interestRate, purpose);
+        assert.equal(result.response.status, 400, `${purpose} should be rejected`);
+    }
+
+    for (const [amount, interestRate, purpose] of [
+        ["0.0001", "0.0001", "minimum four-decimal values"],
+        ["123.4567", "12.3456", "valid four-decimal values"],
+        ["100000000.0000", "100.0000", "maximum boundary values"]
+    ]) {
+        const result = await submitLoan(amount, interestRate, purpose);
+        assert.equal(result.response.status, 200, `${purpose} should be accepted`);
+    }
+
+    const stored = await postgresDb.query(
+        "SELECT amount::text, interest_rate::text FROM loans WHERE user_id = (SELECT id FROM users WHERE email = $1) ORDER BY id",
+        [email]
+    );
+    assert.deepEqual(stored.rows.map(row => [row.amount, row.interest_rate]), [
+        ["0.0001", "0.0001"],
+        ["123.4567", "12.3456"],
+        ["100000000.0000", "100.0000"]
+    ]);
+
+    const borrower = await postgresDb.query("SELECT id FROM users WHERE email = $1", [email]);
+    await postgresDb.query("DELETE FROM loans WHERE user_id = $1", [borrower.rows[0].id]);
+    await postgresDb.query("DELETE FROM audit_logs WHERE actor_user_id = $1", [borrower.rows[0].id]);
+    await postgresDb.query("DELETE FROM users WHERE id = $1", [borrower.rows[0].id]);
 });

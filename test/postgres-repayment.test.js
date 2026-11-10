@@ -29,6 +29,7 @@ test("PostgreSQL schema and repayment locking/idempotency fixture", { skip: !pro
     assert.equal((await database.query("SELECT COUNT(*)::int AS count FROM repayments WHERE loan_id = $1", [loan.rows[0].id])).rows[0].count, 1);
     await database.query("DELETE FROM repayments WHERE loan_id = $1", [loan.rows[0].id]);
     await database.query("DELETE FROM loans WHERE id = $1", [loan.rows[0].id]);
+    await database.query("DELETE FROM audit_logs WHERE actor_user_id = $1", [user.rows[0].id]);
     await database.query("DELETE FROM users WHERE id = $1", [user.rows[0].id]);
 });
 
@@ -59,6 +60,7 @@ test("serializes concurrent repayments and never exceeds the outstanding balance
 
     await database.query("DELETE FROM repayments WHERE loan_id = $1", [loan.rows[0].id]);
     await database.query("DELETE FROM loans WHERE id = $1", [loan.rows[0].id]);
+    await database.query("DELETE FROM audit_logs WHERE actor_user_id = $1", [user.rows[0].id]);
     await database.query("DELETE FROM users WHERE id = $1", [user.rows[0].id]);
 });
 
@@ -86,5 +88,6 @@ test("serializes concurrent duplicate idempotency keys to one repayment", { skip
 
     await database.query("DELETE FROM repayments WHERE loan_id = $1", [loan.rows[0].id]);
     await database.query("DELETE FROM loans WHERE id = $1", [loan.rows[0].id]);
+    await database.query("DELETE FROM audit_logs WHERE actor_user_id = $1", [user.rows[0].id]);
     await database.query("DELETE FROM users WHERE id = $1", [user.rows[0].id]);
 });

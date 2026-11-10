@@ -5,6 +5,7 @@ const Database = require("better-sqlite3");
 const bcrypt = require("bcryptjs");
 const { createPostgresDatabase } = require("./lib/postgres");
 const databasePath = process.env.DATABASE_PATH || "./database/microloan.db";
+if (process.env.NODE_ENV === "production" && (!process.env.DATABASE_URL || !process.env.DATABASE_URL.trim())) { console.error("DATABASE_URL must be configured in production; refusing SQLite fallback."); process.exit(1); }
 const email = typeof process.env.ADMIN_EMAIL === "string" ? process.env.ADMIN_EMAIL.trim().toLowerCase() : "";
 const password = process.env.ADMIN_PASSWORD;
 function validEmail(value) { return value.length >= 3 && value.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value); }
